@@ -13,6 +13,11 @@ MODEL_NAME), so the same code runs on any of the 8 google-cloud models.
 Zero-cost test mode: HARNESS_MOCK=1 runs a scripted 3-step session
 (list -> write deliverable -> done) without any model call.
 
+v0.2.1: `verify_package` tool - deterministic package assembly (sorted
+entries, fixed 1980 timestamps) with read-back verification (entry list +
+integrity test) before `done`; born from the project inventory: 24 of the
+29 dev tasks deliver a package (submission.zip or a world-app folder).
+
 Competences mobilised in this part (system registry): COMP-D4-04 (agent
 design patterns: plan -> tools -> verify -> finish), COMP-D4-01 (MCP over
 the protocol's http bridge), COMP-D4-02 (state/checkpoint discipline for
@@ -45,14 +50,25 @@ Method (follow it in order):
    each step, and verify results against the governing code tables or limits.
 4. Draft the deliverable files, then RE-READ the instruction and verify each
    requirement against what you wrote. Fix gaps before finishing.
-5. Finish with a clear final summary: what was produced, where each file is,
+5. If the deliverable is a package (a submission.zip or a set of files in a
+   folder), call verify_package to assemble and verify it BEFORE finishing:
+   never finish on an unverified package.
+6. Finish with a clear final summary: what was produced, where each file is,
    the key numbers, and any assumption you had to make.
 
 Rules: prefer plain deliverable formats (.md/.txt/.csv/.json/.xlsx/.pdf). \
 Never invent a code clause, a table value or a file you did not read. If data \
 is missing, say so in the deliverable instead of fabricating it. Keep each \
 step small enough to verify. You have a hard time budget; do not start a \
-computation you cannot finish and check."""
+computation you cannot finish and check.
+Engineering discipline (from the project's capability file): no number in a \
+deliverable may come from prose - every figure is produced by a tool and the \
+deliverable states its inputs and formula. For any acceptance or review \
+task, write the governing criterion and its source BEFORE your verdict. If \
+the task lives in MCP world applications, read the whole dossier or declare \
+in the deliverable exactly which parts you did not read. Code you deliver \
+(a script, an IFC model) must be re-parsed or auto-tested before finishing, \
+not merely re-read."""
 
 TOOLS = [
     {
@@ -112,6 +128,21 @@ TOOLS = [
                     "body": {"type": "string"},
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_package",
+            "description": "Assemble and verify a deliverable package inside the task container. Walks the given file/folder paths, optionally writes them into a deterministic zip (sorted entries, fixed timestamps) at zip_path, then reads the package back: full file/entry list with sizes, missing paths, and a zip integrity test. Call this before finishing any package-shaped deliverable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "zip_path": {"type": "string"},
+                },
+                "required": ["paths"],
             },
         },
     },
@@ -200,7 +231,90 @@ async def run_tool(bridge, name, args, state):
             return f"http failed: {r.get('error', 'unknown error')}"
         raw = base64.b64decode(r.get("body_b64", ""))
         return f"status={r.get('status')}\n" + raw.decode("utf-8", "replace")[:TOOL_RESULT_CHAR_CAP]
+    if name == "verify_package":
+        return await verify_package(bridge, args, state)
     return f"unknown tool: {name}"
+
+
+PACKAGE_SCRIPT = r'''
+import json, os, zipfile
+with open(".ple_package_cfg.json") as fh:
+    cfg = json.load(fh)
+report = {"files": [], "missing": [], "zip": None}
+roots = []
+for p in cfg["paths"]:
+    if os.path.isfile(p):
+        roots.append(p)
+    elif os.path.isdir(p):
+        for dp, dn, fn in os.walk(p):
+            dn.sort()
+            for f in sorted(fn):
+                roots.append(os.path.join(dp, f))
+    else:
+        report["missing"].append(p)
+roots = sorted(set(roots))
+for p in roots:
+    report["files"].append({"path": p, "size": os.path.getsize(p)})
+if cfg.get("zip_path"):
+    zp = cfg["zip_path"]
+    parent = os.path.dirname(zp)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in roots:
+            zi = zipfile.ZipInfo(p.lstrip("/"), date_time=(1980, 1, 1, 0, 0, 0))
+            zi.external_attr = 0o644 << 16
+            with open(p, "rb") as fh:
+                z.writestr(zi, fh.read())
+    with zipfile.ZipFile(zp) as z:
+        bad = z.testzip()
+        names = z.namelist()
+    report["zip"] = {"path": zp, "size": os.path.getsize(zp),
+                     "entries": names, "corrupt_entry": bad}
+print(json.dumps(report))
+'''
+
+
+async def verify_package(bridge, args, state):
+    """Deterministic package assembly + read-back verification (v0.2.1)."""
+    cfg = {"paths": args.get("paths", []), "zip_path": args.get("zip_path")}
+    for fname, content in ((".ple_package.py", PACKAGE_SCRIPT),
+                           (".ple_package_cfg.json", json.dumps(cfg))):
+        r = await bridge.call({
+            "type": "write_file", "path": fname,
+            "content_b64": base64.b64encode(content.encode("utf-8")).decode(),
+            "append": False,
+        })
+        if not r.get("ok"):
+            return f"verify_package failed to stage {fname}: {r.get('error', 'unknown error')}"
+    r = await bridge.call({
+        "type": "exec",
+        "command": "python3 .ple_package.py",
+        "timeout_sec": 300,
+    })
+    if r.get("exit_code") != 0:
+        return f"verify_package execution failed:\n{r.get('output', '')}"[:4000]
+    try:
+        report = json.loads((r.get("output") or "").strip().splitlines()[-1])
+    except Exception:
+        return f"verify_package returned an unreadable report:\n{r.get('output', '')}"[:4000]
+    files = report.get("files", [])
+    total = sum(f["size"] for f in files)
+    lines = [f"package contents: {len(files)} file(s), {total} bytes total"]
+    for f in files[:60]:
+        lines.append(f"  {f['path']} ({f['size']} B)")
+    if len(files) > 60:
+        lines.append(f"  ... and {len(files) - 60} more")
+    if report.get("missing"):
+        lines.append("MISSING PATHS: " + ", ".join(report["missing"]))
+    z = report.get("zip")
+    if z:
+        lines.append(f"zip written: {z['path']} ({z['size']} B), {len(z['entries'])} entries, "
+                     f"integrity: {'CORRUPT at ' + str(z['corrupt_entry']) if z['corrupt_entry'] else 'OK'}")
+        state["deliverables"].append(z["path"])
+    ok = bool(files) and not report.get("missing") and (not z or not z["corrupt_entry"])
+    lines.append("PACKAGE OK" if ok else "PACKAGE INCOMPLETE - fix before finishing")
+    return "\n".join(lines)[:TOOL_RESULT_CHAR_CAP]
 
 
 def mark_cache(messages, model_name):
