@@ -55,6 +55,16 @@ class FakeModel(BaseHTTPRequestHandler):
                 }],
             }
             finish = "tool_calls"
+        elif len(tool_msgs) == 2:
+            msg = {
+                "role": "assistant", "content": "Packaging and verifying the deliverable.",
+                "tool_calls": [{
+                    "id": "call_3", "type": "function",
+                    "function": {"name": "verify_package",
+                                 "arguments": json.dumps({"paths": ["report.md"], "zip_path": "bundle.zip"})},
+                }],
+            }
+            finish = "tool_calls"
         else:
             msg = {"role": "assistant", "content": "Final summary from fake model."}
             finish = "stop"
@@ -148,9 +158,17 @@ async def run():
         assert done_msg is not None, "no done frame"
         assert os.path.exists(report), "report.md not written"
         assert open(report).read() == REPORT, "report.md content mismatch"
+        bundle = os.path.join(workdir, "bundle.zip")
+        assert os.path.exists(bundle), "bundle.zip not created by verify_package"
+        import zipfile
+        with zipfile.ZipFile(bundle) as z:
+            assert z.testzip() is None, "bundle.zip corrupt"
+            assert z.namelist() == ["report.md"], f"bundle.zip entries: {z.namelist()}"
+            assert z.read("report.md").decode() == REPORT, "bundle.zip content mismatch"
         assert "Final summary from fake model" in done_msg.get("final_message", ""), "final text missing"
         assert "report.md" in done_msg.get("final_message", ""), "deliverable not listed in summary"
-        assert usage_frames >= 3, f"expected >=3 usage frames, got {usage_frames}"
+        assert "bundle.zip" in done_msg.get("final_message", ""), "package not listed in summary"
+        assert usage_frames >= 4, f"expected >=4 usage frames, got {usage_frames}"
         print(f"AGENT LOOP PASS - usage_frames={usage_frames} workdir={workdir}")
     finally:
         proc.terminate()
