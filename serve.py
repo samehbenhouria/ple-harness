@@ -18,6 +18,14 @@ entries, fixed 1980 timestamps) with read-back verification (entry list +
 integrity test) before `done`; born from the project inventory: 24 of the
 29 dev tasks deliver a package (submission.zip or a world-app folder).
 
+v0.2.2: MCP session management in the `http` tool - the harness (not the
+model) owns the Streamable-HTTP session per task MCP server: it captures
+the `Mcp-Session-Id` and negotiated `MCP-Protocol-Version` returned by
+`initialize`, replays them on later calls, sends
+`notifications/initialized` itself, decodes SSE responses down to the last
+JSON-RPC payload, surfaces useful response headers, and gives http
+results a dedicated 120k-char cap (tool catalogs can reach ~500 KB).
+
 Competences mobilised in this part (system registry): COMP-D4-04 (agent
 design patterns: plan -> tools -> verify -> finish), COMP-D4-01 (MCP over
 the protocol's http bridge), COMP-D4-02 (state/checkpoint discipline for
@@ -34,6 +42,7 @@ import websockets
 
 MAX_FRAME = 16 * 2**20
 TOOL_RESULT_CHAR_CAP = 30000
+HTTP_RESULT_CHAR_CAP = 120000  # MCP tool catalogs can reach ~500 KB
 
 SYSTEM_PROMPT = """You are an autonomous engineering agent solving a real-world \
 physical-engineering task (structural, civil, electrical or mechanical) inside \
@@ -219,21 +228,149 @@ async def run_tool(bridge, name, args, state):
         state["deliverables"].append(args["path"])
         return f"wrote {r.get('size')} bytes to {args['path']}"
     if name == "http":
-        body = args.get("body", "")
-        r = await bridge.call({
-            "type": "http",
-            "method": args.get("method", "POST"),
-            "url": args["url"],
-            "headers": args.get("headers", {}),
-            "body_b64": base64.b64encode(body.encode("utf-8")).decode() if body else "",
-        })
-        if not r.get("ok"):
-            return f"http failed: {r.get('error', 'unknown error')}"
-        raw = base64.b64decode(r.get("body_b64", ""))
-        return f"status={r.get('status')}\n" + raw.decode("utf-8", "replace")[:TOOL_RESULT_CHAR_CAP]
+        return await handle_http(bridge, args, state)
     if name == "verify_package":
         return await verify_package(bridge, args, state)
     return f"unknown tool: {name}"
+
+
+def _header_get(headers, name):
+    """Case-insensitive header lookup on a plain dict."""
+    lname = name.lower()
+    for k, v in (headers or {}).items():
+        if str(k).lower() == lname:
+            return v
+    return None
+
+
+def _mcp_server_key(url, state):
+    """Longest task mcp_servers URL that prefixes this request URL."""
+    best = None
+    for srv in state.get("mcp_servers") or []:
+        surl = srv.get("url") if isinstance(srv, dict) else None
+        if surl and url.startswith(surl) and (best is None or len(surl) > len(best)):
+            best = surl
+    return best
+
+
+def _rpc_method(body_text):
+    """JSON-RPC method of a request body, or None if not a JSON-RPC call."""
+    try:
+        req = json.loads(body_text) if body_text else None
+    except json.JSONDecodeError:
+        return None
+    if isinstance(req, dict):
+        return req.get("method")
+    return None
+
+
+def _decode_http_body(text, content_type):
+    """Return (rendered_text, was_sse).
+
+    Plain bodies pass through untouched. SSE bodies (Content-Type
+    text/event-stream, or any `data:` lines) are reduced to the last
+    complete JSON payload - the JSON-RPC result - so the model never has
+    to parse the event stream itself.
+    """
+    is_sse = "text/event-stream" in (content_type or "").lower()
+    has_data = any(ln.lstrip().lower().startswith("data:") for ln in text.splitlines())
+    if not is_sse and not has_data:
+        return text, False
+    payloads, current = [], []
+    for ln in text.splitlines() + [""]:
+        s = ln.strip()
+        if s.lower().startswith("data:"):
+            current.append(s[len("data:"):].strip())
+        elif current:
+            payloads.append("\n".join(current))
+            current = []
+    last = None
+    for payload in payloads:
+        try:
+            json.loads(payload)
+            last = payload
+        except json.JSONDecodeError:
+            continue
+    return (last if last is not None else text), True
+
+
+async def handle_http(bridge, args, state):
+    """One http bridge call with MCP Streamable-HTTP session discipline.
+
+    The harness (not the model) owns the session: it captures the
+    Mcp-Session-Id returned by `initialize`, replays it together with the
+    negotiated MCP-Protocol-Version on later calls to the same server,
+    sends `notifications/initialized` itself, decodes SSE replies, and
+    surfaces the useful response headers in the tool result.
+    """
+    body = args.get("body", "")
+    url = args["url"]
+    headers = dict(args.get("headers") or {})
+    server_key = _mcp_server_key(url, state)
+    if server_key:
+        if _header_get(headers, "accept") is None:
+            headers["Accept"] = "application/json, text/event-stream"
+        session = (state.get("mcp_sessions") or {}).get(server_key)
+        if session:
+            if _header_get(headers, "mcp-session-id") is None and session.get("session_id"):
+                headers["Mcp-Session-Id"] = session["session_id"]
+            if _header_get(headers, "mcp-protocol-version") is None and session.get("protocol_version"):
+                headers["MCP-Protocol-Version"] = session["protocol_version"]
+    r = await bridge.call({
+        "type": "http",
+        "method": args.get("method", "POST"),
+        "url": url,
+        "headers": headers,
+        "body_b64": base64.b64encode(body.encode("utf-8")).decode() if body else "",
+    })
+    if not r.get("ok"):
+        return f"http failed: {r.get('error', 'unknown error')}"
+    resp_headers = r.get("headers") or {}
+    text = base64.b64decode(r.get("body_b64", "")).decode("utf-8", "replace")
+    content_type = _header_get(resp_headers, "content-type") or ""
+    decoded, _was_sse = _decode_http_body(text, content_type)
+    notes = []
+    if server_key and _rpc_method(body) == "initialize":
+        sid = _header_get(resp_headers, "mcp-session-id")
+        if sid:
+            version = None
+            try:
+                parsed = json.loads(decoded)
+                if isinstance(parsed, dict):
+                    version = (parsed.get("result") or {}).get("protocolVersion")
+            except json.JSONDecodeError:
+                pass
+            state.setdefault("mcp_sessions", {})[server_key] = {
+                "session_id": sid, "protocol_version": version,
+            }
+            notif_headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Mcp-Session-Id": sid,
+            }
+            if version:
+                notif_headers["MCP-Protocol-Version"] = version
+            notif_body = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            await bridge.call({
+                "type": "http", "method": "POST", "url": url,
+                "headers": notif_headers,
+                "body_b64": base64.b64encode(notif_body.encode("utf-8")).decode(),
+            })
+            notes.append("[harness: MCP session established; notifications/initialized sent]")
+    lines = [f"status={r.get('status')}"]
+    for hname in ("Mcp-Session-Id", "Content-Type"):
+        val = _header_get(resp_headers, hname)
+        if val is not None:
+            lines.append(f"header {hname}: {val}")
+    lines.extend(notes)
+    if len(decoded) > HTTP_RESULT_CHAR_CAP:
+        total = len(decoded)
+        decoded = decoded[:HTTP_RESULT_CHAR_CAP] + (
+            f"\n[truncated by harness: http result was {total} chars; "
+            f"showing first {HTTP_RESULT_CHAR_CAP}]"
+        )
+    lines.append(decoded)
+    return "\n".join(lines)
 
 
 PACKAGE_SCRIPT = r'''
@@ -405,7 +542,11 @@ async def agent_run(bridge, task):
     timeout = limits.get("agent_timeout_sec") or 6 * 3600
     started = time.monotonic()
     deadline = started + timeout * 0.92
-    state = {"deliverables": []}
+    state = {
+        "deliverables": [],
+        "mcp_servers": task.get("mcp_servers") or [],
+        "mcp_sessions": {},  # server URL -> {"session_id", "protocol_version"}
+    }
 
     def remaining_min():
         return max(0, int((started + timeout - time.monotonic()) // 60))
