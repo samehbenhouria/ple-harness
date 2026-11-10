@@ -26,6 +26,16 @@ the `Mcp-Session-Id` and negotiated `MCP-Protocol-Version` returned by
 JSON-RPC payload, surfaces useful response headers, and gives http
 results a dedicated 120k-char cap (tool catalogs can reach ~500 KB).
 
+v0.3: optional `plan-verify` mode, enabled by the environment variable
+PLE_MODE=planverify (absent = the v0.2.2 loop above, unchanged). Three
+roles in SEPARATE conversations, after the kit's official plan-verify
+sample: a planner (about 10% of the time budget) writes a plan from the
+inventory; a worker executes the plan with the tools until about 25% of
+the budget remains; an independent verifier re-reads the deliverables in
+a FRESH conversation (no worker history) and returns ACCEPT, or REJECT
+with precise corrections the worker then applies in its own conversation
+- at most 2 correction rounds before `done`.
+
 Competences mobilised in this part (system registry): COMP-D4-04 (agent
 design patterns: plan -> tools -> verify -> finish), COMP-D4-01 (MCP over
 the protocol's http bridge), COMP-D4-02 (state/checkpoint discipline for
@@ -78,6 +88,55 @@ the task lives in MCP world applications, read the whole dossier or declare \
 in the deliverable exactly which parts you did not read. Code you deliver \
 (a script, an IFC model) must be re-parsed or auto-tested before finishing, \
 not merely re-read."""
+
+PLANNER_PROMPT = """You are the planner in a three-role team (planner -> \
+worker -> verifier) solving a real-world physical-engineering task inside \
+an isolated project container. You act through tools: exec (bash) and \
+read_file - for INVENTORY ONLY.
+
+Your job:
+1. Inventory the workdir: list it recursively, skim the key input files,
+   and note superseded/revised versions - the newest governing revision wins.
+2. Write a PLAN as plain text for the worker. Do NOT write or modify any
+   deliverable yourself.
+
+The plan must contain:
+- the exact deliverables (paths, formats) the instruction demands;
+- the governing documents, codes and standards, and the key input data,
+  naming the files they live in;
+- the execution steps in order, naming the computation or check each
+  step performs;
+- the verification criteria the verifier will apply (quantities,
+  tolerances, required sections, package checks);
+- the main risks and assumptions.
+
+Rules: never invent a code clause, a table value or a file you did not \
+read. Stop as soon as the plan is complete: your final message IS the \
+plan (no tool calls in it). You hold a small slice of the total time \
+budget - be efficient."""
+
+VERIFIER_PROMPT = """You are an independent verifier in a three-role team \
+(planner -> worker -> verifier) for a physical-engineering task. You are \
+seeing this task in a FRESH conversation: you have none of the worker's \
+reasoning or tool history - only the instruction, the plan, and whatever \
+you re-read yourself from the container with read_file and exec.
+
+Method:
+1. Re-read every deliverable the worker claims (paths are given below),
+   plus any input file needed to check a number.
+2. Check, item by item: the deliverables exist at the exact paths; every
+   requirement of the instruction is met; numbers carry their inputs,
+   formula and units and match a recomputation or the governing table;
+   package deliverables are properly assembled (a zip lists its expected
+   entries); nothing is fabricated - any claimed code clause, table value
+   or file must actually exist.
+3. Give your verdict as your final message, in EXACTLY this format:
+   First line: VERDICT: ACCEPT   (only if every check passes)
+   or:         VERDICT: REJECT
+   If REJECT, follow with the heading CORRECTIONS: and a numbered list -
+   each item names the file, the defect, and the exact fix required, so
+   the worker can apply the list without further interpretation.
+Do not fix anything yourself: you have no mandate to write deliverables."""
 
 TOOLS = [
     {
@@ -488,6 +547,15 @@ async def mock_run(bridge, task):
 RETRY_WAITS = [5, 15, 45, 120]
 WRAP_UP_SEC = 240
 
+# plan-verify mode (v0.3, PLE_MODE=planverify) budget split, after the
+# official plan-verify sample: the planner gets ~10% of the task budget,
+# the worker's first pass ends when ~25% of the budget remains, and the
+# verifier plus correction rounds live in that reserve, still bounded by
+# the global discipline (stop at 92% of agent_timeout_sec, wrap-up).
+PLAN_FRACTION = 0.10
+VERIFY_RESERVE_FRACTION = 0.25
+MAX_CORRECTION_ROUNDS = 2
+
 
 def _trim_old_tool_outputs(messages, keep=1000):
     """Shrink older long tool results in place (context-length recovery)."""
@@ -620,12 +688,229 @@ async def agent_run(bridge, task):
     await bridge.ws.send(json.dumps({"type": "done", "final_message": summary[:15000]}))
 
 
+async def _drive_conversation(bridge, client, model, messages, state, *, started,
+                              timeout, deadline, phase_end, finish_note):
+    """Drive ONE tool-calling conversation (one plan-verify phase).
+
+    Mirrors agent_run's discipline: usage is reported after every model
+    call, the last non-empty assistant text is tracked, empty or cut-off
+    replies are nudged, and the tools are disabled for a closing answer
+    when the phase budget ends or the global wrap-up window opens
+    (last WRAP_UP_SEC of the task). Stops at the global deadline.
+    Returns the conversation's last non-empty assistant text.
+    """
+    def remaining_min():
+        return max(0, int((started + timeout - time.monotonic()) // 60))
+
+    final_text = ""
+    nudges = 0
+    forced = False
+    for _turn in range(300):
+        now = time.monotonic()
+        if now > deadline:
+            await bridge.log("plan-verify: global time budget reached; closing phase")
+            break
+        tool_choice = "auto"
+        closing = False
+        if not forced and now >= phase_end:
+            forced = True
+            closing = True
+            messages.append({"role": "user", "content": finish_note})
+        elif not forced and (started + timeout - now) < WRAP_UP_SEC:
+            forced = True
+            closing = True
+            messages.append({
+                "role": "user",
+                "content": "Time is almost up. Do not call any more tools. " + finish_note,
+            })
+        if closing:
+            tool_choice = "none"
+        resp = await _create_with_retries(bridge, client, model, messages, deadline, tool_choice)
+        await bridge.usage(model, getattr(resp, "usage", None))
+        choice = resp.choices[0]
+        msg = choice.message
+        messages.append(msg.model_dump(exclude_none=True))
+        if msg.content:
+            final_text = msg.content
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result = await run_tool(bridge, tc.function.name, args, state)
+                result += f"\n[time remaining: ~{remaining_min()} min]"
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            continue
+        if closing:
+            break
+        if (choice.finish_reason == "length" or not (msg.content or "").strip()) and nudges < 3:
+            nudges += 1
+            messages.append({
+                "role": "user",
+                "content": "Your last reply was empty or cut off. Continue exactly where you stopped.",
+            })
+            continue
+        break
+    return final_text
+
+
+def _parse_verdict(text):
+    """Structured verifier verdict -> (ACCEPT|REJECT, corrections_text).
+
+    An explicit VERDICT: ACCEPT accepts. Anything else that carries an
+    explicit ACCEPT also accepts; otherwise the text is treated as a
+    rejection whose body becomes the worker's correction list (the round
+    cap bounds any unstructured loop).
+    """
+    body = (text or "").strip()
+    upper = body.upper()
+    if "VERDICT: ACCEPT" in upper or ("VERDICT:" not in upper and "ACCEPT" in upper):
+        return "ACCEPT", ""
+    return "REJECT", body
+
+
+async def plan_verify_run(bridge, task):
+    """v0.3 plan-verify mode: planner -> worker -> fresh verifier.
+
+    Three separate conversations (see PLANNER_PROMPT / VERIFIER_PROMPT).
+    The worker's conversation is the only one that persists across
+    correction rounds; every verifier pass starts from a brand-new
+    message list holding only the instruction, the plan, and what the
+    verifier re-reads itself through the tools.
+    """
+    from openai import AsyncOpenAI
+
+    model = os.environ.get("MODEL_NAME", "")
+    client = AsyncOpenAI()  # reads OPENAI_BASE_URL / OPENAI_API_KEY
+    limits = task.get("limits") or {}
+    timeout = limits.get("agent_timeout_sec") or 6 * 3600
+    started = time.monotonic()
+    deadline = started + timeout * 0.92
+    planner_end = started + timeout * PLAN_FRACTION
+    worker_end = started + timeout * (1 - VERIFY_RESERVE_FRACTION)
+    state = {
+        "deliverables": [],
+        "mcp_servers": task.get("mcp_servers") or [],
+        "mcp_sessions": {},
+    }
+
+    instruction = task.get("instruction", "")
+    mcp_note = ""
+    if task.get("mcp_servers"):
+        mcp_note = "\nMCP servers available via the http tool: " + json.dumps(task["mcp_servers"])
+    workdir_note = f"Workdir: {task.get('workdir', '/app')}{mcp_note}"
+
+    worker_text = "No deliverable summary produced."
+    verdict_label = "UNVERIFIED (verifier never produced a verdict)"
+    rounds = 0
+    try:
+        # --- phase 1: planner (own conversation, ~10% of the budget) ---
+        await bridge.log("plan-verify: planner phase")
+        planner_messages = [
+            {"role": "system", "content": PLANNER_PROMPT},
+            {"role": "user", "content": (
+                f"Task instruction:\n{instruction}\n\n{workdir_note}\n"
+                "Start with the inventory step, then write the plan."
+            )},
+        ]
+        plan_text = await _drive_conversation(
+            bridge, client, model, planner_messages, state,
+            started=started, timeout=timeout, deadline=deadline,
+            phase_end=planner_end,
+            finish_note="Your planning time is up. Write the complete plan NOW as plain text: "
+                        "deliverables, steps, verification criteria. Do not call any more tools.",
+        )
+        if not plan_text.strip():
+            plan_text = "(The planner produced no plan text; work directly from the instruction.)"
+
+        # --- phase 2: worker (own conversation, plan as its brief) ---
+        await bridge.log("plan-verify: worker phase")
+        worker_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Task instruction:\n{instruction}\n\n{workdir_note}\n\n"
+                "Plan produced by the planner - follow it; deviate only if the "
+                "container proves it wrong, and say so in your summary:\n" + plan_text
+            )},
+        ]
+        worker_text = await _drive_conversation(
+            bridge, client, model, worker_messages, state,
+            started=started, timeout=timeout, deadline=deadline,
+            phase_end=worker_end,
+            finish_note="Your execution window is closing. Finish the deliverables NOW "
+                        "and write a brief summary of what you produced and where.",
+        ) or worker_text
+
+        # --- phase 3: verifier (FRESH conversation per pass) + corrections ---
+        while True:
+            await bridge.log(f"plan-verify: verifier pass (after {rounds} correction round(s))")
+            verifier_messages = [
+                {"role": "system", "content": VERIFIER_PROMPT},
+                {"role": "user", "content": (
+                    f"Task instruction:\n{instruction}\n\n"
+                    f"Plan the worker was given:\n{plan_text}\n\n"
+                    "Deliverables the worker says it wrote (verify each by re-reading "
+                    f"it yourself): {', '.join(state['deliverables']) or 'none recorded'}\n"
+                    f"{workdir_note}"
+                )},
+            ]
+            verdict_text = await _drive_conversation(
+                bridge, client, model, verifier_messages, state,
+                started=started, timeout=timeout, deadline=deadline,
+                phase_end=deadline,
+                finish_note="Give your verdict NOW in the required format: first line "
+                            "VERDICT: ACCEPT or VERDICT: REJECT, then CORRECTIONS: if rejecting.",
+            )
+            if not verdict_text.strip():
+                verdict_label = "UNVERIFIED (verifier produced no verdict text)"
+                break
+            verdict, corrections = _parse_verdict(verdict_text)
+            if verdict == "ACCEPT":
+                verdict_label = "ACCEPT"
+                break
+            if rounds >= MAX_CORRECTION_ROUNDS or time.monotonic() > deadline:
+                verdict_label = f"REJECT (final; {rounds} correction round(s) used)"
+                break
+            rounds += 1
+            await bridge.log(f"plan-verify: verifier REJECTED; correction round {rounds}")
+            worker_messages.append({
+                "role": "user",
+                "content": (
+                    "An independent verifier reviewed your deliverables in a fresh "
+                    "conversation and REJECTED them. Apply these corrections exactly, "
+                    f"then confirm what you changed:\n{corrections}"
+                ),
+            })
+            worker_text = await _drive_conversation(
+                bridge, client, model, worker_messages, state,
+                started=started, timeout=timeout, deadline=deadline,
+                phase_end=deadline,
+                finish_note="Your correction window is closing. Finish the corrections NOW "
+                            "and confirm what you changed.",
+            ) or worker_text
+    except Cancelled:
+        verdict_label = "UNVERIFIED (cancelled)"
+
+    written = ", ".join(state["deliverables"]) or "none recorded"
+    summary = (
+        f"{worker_text}\n\n"
+        f"Plan-verify: planner -> worker -> independent verifier (fresh conversation); "
+        f"final verifier verdict: {verdict_label}; correction rounds used: {rounds} "
+        f"of {MAX_CORRECTION_ROUNDS} max.\n"
+        f"Deliverable files written via write_file: {written}"
+    )
+    await bridge.ws.send(json.dumps({"type": "done", "final_message": summary[:15000]}))
+
+
 async def session(ws):
     bridge = Bridge(ws)
     try:
         task = json.loads(await ws.recv())
         if os.environ.get("HARNESS_MOCK") == "1":
             await mock_run(bridge, task)
+        elif os.environ.get("PLE_MODE") == "planverify":
+            await plan_verify_run(bridge, task)
         else:
             await agent_run(bridge, task)
     except Cancelled:
